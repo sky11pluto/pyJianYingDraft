@@ -1,11 +1,12 @@
 """剪映自动化控制，主要与自动导出有关"""
 
+import os
 import time
 import shutil
 import uiautomation as uia
 
 from enum import Enum
-from typing import Optional, Literal, Callable
+from typing import Optional, Literal, Callable, List
 
 from . import exceptions
 from .exceptions import AutomationError
@@ -59,9 +60,259 @@ class JianyingController:
     """剪映窗口"""
     app_status: Literal["home", "edit", "pre_export"]
 
+    # 仅匹配明确的干扰弹窗标题（禁止对剪映主窗做深度 SubName 扫描，否则会卡死）
+    _BLOCKING_POPUP_KEYWORDS = (
+        "未检测到音频",
+        "未检测到",
+        "音频设备",
+        "没有监测的音频",
+        "监测的音频",
+        "未发现音频",
+    )
+    _DISMISS_BUTTON_NAMES = (
+        "确定",
+        "确认",
+        "知道了",
+        "我知道了",
+        "好的",
+        "OK",
+        "Ok",
+        "ok",
+    )
+
     def __init__(self):
         """初始化剪映控制器, 此时剪映应该处于目录页"""
         self.get_window()
+        self.dismiss_blocking_dialogs()
+
+    def dismiss_blocking_dialogs(self, rounds: int = 1) -> int:
+        """轻量关闭桌面顶层「音频设备」类弹窗（仅看窗口标题，不做 Exists 超时等待）。"""
+        closed = 0
+        for _ in range(max(1, rounds)):
+            hit = False
+            try:
+                desktop = uia.GetRootControl()
+                for win in desktop.GetChildren():
+                    try:
+                        name = (win.Name or "")
+                    except Exception:
+                        continue
+                    if not name or not any(k in name for k in self._BLOCKING_POPUP_KEYWORDS):
+                        continue
+                    if self._click_dismiss_button_under(win):
+                        closed += 1
+                        hit = True
+                        print(f"已关闭剪映提示弹窗: {name}")
+                        time.sleep(0.15)
+            except Exception:
+                pass
+            if not hit:
+                break
+        return closed
+
+    def _click_dismiss_button_under(self, root) -> bool:
+        """仅在已锁定的弹窗根节点下浅搜确认按钮（Exists(0) 避免数秒空等）。"""
+        if root is None:
+            return False
+        for btn_name in self._DISMISS_BUTTON_NAMES:
+            try:
+                btn = root.ButtonControl(Name=btn_name, searchDepth=3)
+                if btn.Exists(0):
+                    btn.Click(simulateMove=False)
+                    return True
+            except Exception:
+                pass
+            try:
+                txt = root.TextControl(Name=btn_name, searchDepth=3)
+                if txt.Exists(0):
+                    try:
+                        txt.Click(simulateMove=False)
+                        return True
+                    except Exception:
+                        parent = txt.GetParentControl()
+                        if parent is not None:
+                            parent.Click(simulateMove=False)
+                            return True
+            except Exception:
+                pass
+        return False
+
+    def _wait_control(self, factory, timeout: float = 15.0, interval: float = 0.25):
+        """轮询等待控件出现，返回控件或 None。"""
+        deadline = time.time() + timeout
+        last_dismiss = 0.0
+        while time.time() < deadline:
+            now = time.time()
+            if now - last_dismiss >= 6.0:
+                self.dismiss_blocking_dialogs(rounds=1)
+                last_dismiss = now
+            self.get_window(activate=False)
+            ctrl = factory()
+            if ctrl is not None and ctrl.Exists(0):
+                return ctrl
+            time.sleep(interval)
+        return None
+
+    def _read_export_path(self) -> Optional[str]:
+        """尝试读取导出对话框中的路径；5.9 部分界面无该自动化节点时返回 None。"""
+        for depth in (2, 1):
+            try:
+                sib = self.app.TextControl(
+                    searchDepth=depth,
+                    Compare=ControlFinder.desc_matcher("ExportPath"),
+                )
+                if not sib.Exists(0):
+                    continue
+                text_ctrl = sib.GetSiblingControl(lambda ctrl: True)
+                if text_ctrl is None:
+                    continue
+                try:
+                    path = text_ctrl.GetPropertyValue(30159)
+                except Exception:
+                    path = getattr(text_ctrl, "Name", None) or ""
+                path = (path or "").strip()
+                if path:
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _try_set_export_resolution_framerate(
+        self,
+        resolution: Optional[ExportResolution],
+        framerate: Optional[ExportFramerate],
+    ) -> None:
+        """在导出对话框中尽量设置分辨率/帧率；失败只打印警告，不抛错。"""
+        if resolution is None and framerate is None:
+            return
+        try:
+            self.get_window(activate=False)
+        except Exception:
+            pass
+
+        def _pick_dropdown(input_desc: str, value: str, label: str) -> bool:
+            try:
+                btn = None
+                try:
+                    setting_group = self.app.GroupControl(searchDepth=1, foundIndex=4)
+                    if setting_group.Exists(0):
+                        btn = setting_group.TextControl(
+                            searchDepth=2,
+                            Compare=ControlFinder.desc_matcher(input_desc),
+                        )
+                except Exception:
+                    btn = None
+                if btn is None or not btn.Exists(0):
+                    btn = self.app.TextControl(
+                        searchDepth=2,
+                        Compare=ControlFinder.desc_matcher(input_desc),
+                    )
+                if not btn.Exists(0.4):
+                    print(f"警告: 未找到导出{label}下拉框，跳过设置 {value}")
+                    return False
+                btn.Click(simulateMove=False)
+                time.sleep(0.35)
+                item = self.app.TextControl(
+                    searchDepth=2,
+                    Compare=ControlFinder.desc_matcher(value),
+                )
+                if not item.Exists(0.5):
+                    print(f"警告: 未找到导出{label}选项 {value}，跳过")
+                    return False
+                item.Click(simulateMove=False)
+                time.sleep(0.25)
+                print(f"[导出] 已设置{label}: {value}")
+                return True
+            except Exception as exc:
+                print(f"警告: 设置导出{label}失败({value}): {exc}")
+                return False
+
+        if resolution is not None:
+            _pick_dropdown("ExportSharpnessInput", resolution.value, "分辨率")
+        if framerate is not None:
+            _pick_dropdown("FrameRateInput", framerate.value, "帧率")
+
+    def _settle_exported_file(
+        self,
+        *,
+        export_path: Optional[str],
+        output_path: str,
+        draft_name: str,
+        since_ts: float,
+        timeout: float = 60.0,
+    ) -> None:
+        """将剪映导出结果落到 output_path（move / 目录轮询）。"""
+        output_path = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+        if export_path:
+            export_path = os.path.abspath(export_path)
+            if os.path.isdir(export_path):
+                candidates = []
+                for name in os.listdir(export_path):
+                    if not name.lower().endswith(".mp4"):
+                        continue
+                    full = os.path.join(export_path, name)
+                    try:
+                        if os.path.getmtime(full) >= since_ts - 5 and os.path.getsize(full) > 1024:
+                            candidates.append(full)
+                    except OSError:
+                        continue
+                if candidates:
+                    export_path = max(candidates, key=os.path.getmtime)
+
+            if os.path.isfile(export_path) and os.path.getsize(export_path) > 1024:
+                if os.path.abspath(export_path) != output_path:
+                    if os.path.isfile(output_path):
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                    shutil.move(export_path, output_path)
+                return
+
+        search_dir = os.path.dirname(output_path) or "."
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            candidates = []
+            try:
+                for name in os.listdir(search_dir):
+                    if not name.lower().endswith(".mp4"):
+                        continue
+                    full = os.path.join(search_dir, name)
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        continue
+                    if st.st_mtime < since_ts - 5 or st.st_size < 1024:
+                        continue
+                    candidates.append(full)
+            except OSError:
+                candidates = []
+
+            preferred = [p for p in candidates if draft_name in os.path.basename(p)]
+            ordered = sorted(preferred or candidates, key=os.path.getmtime, reverse=True)
+            if ordered:
+                src = ordered[0]
+                if os.path.abspath(src) != output_path:
+                    if os.path.isfile(output_path):
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                    try:
+                        shutil.move(src, output_path)
+                    except OSError:
+                        shutil.copy2(src, output_path)
+                if os.path.isfile(output_path) and os.path.getsize(output_path) > 1024:
+                    return
+            time.sleep(1)
+
+        if not (os.path.isfile(output_path) and os.path.getsize(output_path) > 1024):
+            raise AutomationError(
+                "导出完成但未在目标目录找到成片文件。"
+                "请确认剪映默认导出目录与 output_path 一致"
+            )
 
     def export_draft(self, draft_name: str, output_path: Optional[str] = None, *,
                      resolution: Optional[ExportResolution] = None,
@@ -83,10 +334,13 @@ class JianyingController:
             `AutomationError`: 剪映操作失败
         """
         print(f"开始导出 {draft_name} 至 {output_path}")
+        export_since = time.time()
+        self.dismiss_blocking_dialogs()
         self.get_window()
         self.switch_to_home()
 
         # 点击对应草稿
+        print(f"[导出] 查找草稿: {draft_name}")
         draft_name_text = self.app.TextControl(
             searchDepth=2,
             Compare=ControlFinder.desc_matcher(f"HomePageDraftTitle:{draft_name}", exact=True)
@@ -96,78 +350,103 @@ class JianyingController:
         draft_btn = draft_name_text.GetParentControl()
         assert draft_btn is not None
         draft_btn.Click(simulateMove=False)
-        time.sleep(10)
-        self.get_window()
-
-        # 点击导出按钮
-        export_btn = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("MainWindowTitleBarExportBtn"))
+        print("[导出] 已打开草稿，等待编辑器就绪…")
+        # 只轻量等 MainWindow 出现；不要每轮深搜 ExportBtn / SetTopmost（会卡好几秒）
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            try:
+                edit_win = uia.WindowControl(
+                    searchDepth=1,
+                    Compare=lambda c, _d: (
+                        (c.Name or "") == "剪映专业版"
+                        and "mainwindow" in (c.ClassName or "").lower()
+                    ),
+                )
+                if edit_win.Exists(0):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.12)
+        self.get_window(activate=True)
+        export_btn = self.app.TextControl(
+            searchDepth=2,
+            Compare=ControlFinder.desc_matcher("MainWindowTitleBarExportBtn"),
+        )
+        # 编辑器控件偶发晚于窗口出现，最多再短等约 2s
+        if not export_btn.Exists(0):
+            for _ in range(16):
+                time.sleep(0.12)
+                export_btn = self.app.TextControl(
+                    searchDepth=2,
+                    Compare=ControlFinder.desc_matcher("MainWindowTitleBarExportBtn"),
+                )
+                if export_btn.Exists(0):
+                    break
         if not export_btn.Exists(0):
             raise AutomationError("未在编辑窗口中找到导出按钮")
+
+        # 点击标题栏导出
+        print("[导出] 点击标题栏导出按钮…")
         export_btn.Click(simulateMove=False)
-        time.sleep(10)
+        print("[导出] 已点标题栏导出，等待导出对话框…")
+
+        # 等待导出对话框（ExportOkBtn）
+        ok_btn = self._wait_control(
+            lambda: self.app.TextControl(
+                searchDepth=2,
+                Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True),
+            ),
+            timeout=20.0,
+        )
+        if ok_btn is None:
+            self.dismiss_blocking_dialogs(rounds=1)
+            self.get_window()
+            ok_btn = self.app.TextControl(
+                searchDepth=2,
+                Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True),
+            )
+            if not ok_btn.Exists(0):
+                raise AutomationError("导出窗口未出现或未找到导出按钮")
+
+        # 路径只快读一次；读不到则目录轮询
+        export_path = self._read_export_path()
+        if not export_path:
+            print("警告: 未找到导出路径框，将改用 output_path/导出目录轮询收片")
+
+        # 尽量设为指定分辨率/帧率（短超时；失败仅警告，不阻断导出）
+        self._try_set_export_resolution_framerate(resolution, framerate)
+
+        # 立刻点导出确认
+        print("[导出] 点击导出确认按钮…")
         self.get_window()
-
-        # 获取原始导出路径（带后缀名）
-        export_path_sib = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportPath"))
-        if not export_path_sib.Exists(0):
-            raise AutomationError("未找到导出路径框")
-        export_path_text = export_path_sib.GetSiblingControl(lambda ctrl: True)
-        assert export_path_text is not None
-        export_path = export_path_text.GetPropertyValue(30159)
-
-        # 设置分辨率
-        if resolution is not None:
-            setting_group = self.app.GroupControl(searchDepth=1,
-                                                  Compare=ControlFinder.class_name_matcher("PanelSettingsGroup_QMLTYPE"))
-            if not setting_group.Exists(0):
-                raise AutomationError("未找到导出设置组")
-            resolution_btn = setting_group.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportSharpnessInput"))
-            if not resolution_btn.Exists(0.5):
-                raise AutomationError("未找到导出分辨率下拉框")
-            resolution_btn.Click(simulateMove=False)
-            time.sleep(0.5)
-            resolution_item = self.app.TextControl(
-                searchDepth=2, Compare=ControlFinder.desc_matcher(resolution.value)
-            )
-            if not resolution_item.Exists(0.5):
-                raise AutomationError(f"未找到{resolution.value}分辨率选项")
-            resolution_item.Click(simulateMove=False)
-            time.sleep(0.5)
-
-        # 设置帧率
-        if framerate is not None:
-            setting_group = self.app.GroupControl(searchDepth=1,
-                                                  Compare=ControlFinder.class_name_matcher("PanelSettingsGroup_QMLTYPE"))
-            if not setting_group.Exists(0):
-                raise AutomationError("未找到导出设置组")
-            framerate_btn = setting_group.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("FrameRateInput"))
-            if not framerate_btn.Exists(0.5):
-                raise AutomationError("未找到导出帧率下拉框")
-            framerate_btn.Click(simulateMove=False)
-            time.sleep(0.5)
-            framerate_item = self.app.TextControl(
-                searchDepth=2, Compare=ControlFinder.desc_matcher(framerate.value)
-            )
-            if not framerate_item.Exists(0.5):
-                raise AutomationError(f"未找到{framerate.value}帧率选项")
-            framerate_item.Click(simulateMove=False)
-            time.sleep(0.5)
-
-
-        # 点击导出
         export_btn = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True))
         if not export_btn.Exists(0):
             raise AutomationError("未在导出窗口中找到导出按钮")
         export_btn.Click(simulateMove=False)
-        time.sleep(5)
+        print("[导出] 已开始导出，等待完成…")
+        time.sleep(1.2)
 
         # 等待导出完成
         st = time.time()
+        last_dismiss = 0.0
         while True:
-            self.get_window()
-            if self.app_status != "pre_export": continue
+            now = time.time()
+            if now - last_dismiss >= 8.0:
+                self.dismiss_blocking_dialogs(rounds=1)
+                last_dismiss = now
+            self.get_window(activate=False)
+            if self.app_status != "pre_export":
+                if output_path and os.path.isfile(output_path) and os.path.getsize(output_path) > 1024:
+                    break
+                time.sleep(0.8)
+                if time.time() - st > timeout:
+                    raise AutomationError("导出超时, 时限为%d秒" % timeout)
+                continue
 
-            succeed_close_btn = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportSucceedCloseBtn"))
+            succeed_close_btn = self.app.TextControl(
+                searchDepth=2,
+                Compare=ControlFinder.desc_matcher("ExportSucceedCloseBtn"),
+            )
             if succeed_close_btn.Exists(0):
                 succeed_close_btn.Click(simulateMove=False)
                 break
@@ -175,35 +454,46 @@ class JianyingController:
             if time.time() - st > timeout:
                 raise AutomationError("导出超时, 时限为%d秒" % timeout)
 
-            time.sleep(1)
-        time.sleep(2)
+            time.sleep(0.8)
+        time.sleep(0.5)
 
         # 回到目录页
-        self.get_window()
-        self.switch_to_home()
-        time.sleep(2)
+        self.get_window(activate=True)
+        try:
+            self.switch_to_home()
+        except AutomationError:
+            pass
+        time.sleep(0.5)
 
-        # 复制导出的文件到指定目录
         if output_path is not None:
-            shutil.move(export_path, output_path)
+            self._settle_exported_file(
+                export_path=export_path,
+                output_path=output_path,
+                draft_name=draft_name,
+                since_ts=export_since,
+            )
 
         print(f"导出 {draft_name} 至 {output_path} 完成")
 
     def switch_to_home(self) -> None:
         """切换到剪映主页"""
+        self.dismiss_blocking_dialogs(rounds=1)
         if self.app_status == "home":
             return
         if self.app_status != "edit":
             raise AutomationError("仅支持从编辑模式切换到主页")
         close_btn = self.app.GroupControl(searchDepth=1, ClassName="TitleBarButton", foundIndex=3)
         close_btn.Click(simulateMove=False)
-        time.sleep(2)
-        self.get_window()
+        time.sleep(0.8)
+        self.get_window(activate=True)
 
-    def get_window(self) -> None:
-        """寻找剪映窗口并置顶"""
+    def get_window(self, *, activate: bool = True) -> None:
+        """寻找剪映窗口；activate=True 时置顶（等待阶段应传 False，避免拖慢）。"""
         if hasattr(self, "app") and self.app.Exists(0):
-            self.app.SetTopmost(False)
+            try:
+                self.app.SetTopmost(False)
+            except Exception:
+                pass
 
         self.app = uia.WindowControl(searchDepth=1, Compare=self.__jianying_window_cmp)
         if not self.app.Exists(0):
@@ -215,8 +505,9 @@ class JianyingController:
             self.app = export_window
             self.app_status = "pre_export"
 
-        self.app.SetActive()
-        self.app.SetTopmost()
+        if activate:
+            self.app.SetActive()
+            self.app.SetTopmost()
 
     def __jianying_window_cmp(self, control: uia.WindowControl, depth: int) -> bool:
         if control.Name != "剪映专业版":
