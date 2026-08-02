@@ -351,39 +351,21 @@ class JianyingController:
         assert draft_btn is not None
         draft_btn.Click(simulateMove=False)
         print("[导出] 已打开草稿，等待编辑器就绪…")
-        # 只轻量等 MainWindow 出现；不要每轮深搜 ExportBtn / SetTopmost（会卡好几秒）
-        deadline = time.time() + 20.0
-        while time.time() < deadline:
-            try:
-                edit_win = uia.WindowControl(
-                    searchDepth=1,
-                    Compare=lambda c, _d: (
-                        (c.Name or "") == "剪映专业版"
-                        and "mainwindow" in (c.ClassName or "").lower()
-                    ),
-                )
-                if edit_win.Exists(0):
-                    break
-            except Exception:
-                pass
-            time.sleep(0.12)
-        self.get_window(activate=True)
-        export_btn = self.app.TextControl(
-            searchDepth=2,
-            Compare=ControlFinder.desc_matcher("MainWindowTitleBarExportBtn"),
-        )
-        # 编辑器控件偶发晚于窗口出现，最多再短等约 2s
-        if not export_btn.Exists(0):
-            for _ in range(16):
-                time.sleep(0.12)
-                export_btn = self.app.TextControl(
-                    searchDepth=2,
-                    Compare=ControlFinder.desc_matcher("MainWindowTitleBarExportBtn"),
-                )
-                if export_btn.Exists(0):
-                    break
-        if not export_btn.Exists(0):
-            raise AutomationError("未在编辑窗口中找到导出按钮")
+        # 长草稿加载慢：优先锁定 MainWindow（勿误用仍存活的 HomePage）
+        if not self._wait_edit_window(timeout=90.0):
+            raise AutomationError("打开草稿后未进入编辑窗口（MainWindow）")
+        self.app.SetActive()
+        try:
+            self.app.SetTopmost()
+        except Exception:
+            pass
+
+        export_btn = self._wait_titlebar_export_btn(timeout=90.0)
+        if export_btn is None:
+            raise AutomationError(
+                "未在编辑窗口中找到导出按钮。"
+                "请确认剪映已进入时间线编辑页、无遮挡弹窗，且版本支持自动化导出"
+            )
 
         # 点击标题栏导出
         print("[导出] 点击标题栏导出按钮…")
@@ -487,35 +469,144 @@ class JianyingController:
         time.sleep(0.8)
         self.get_window(activate=True)
 
+    def _find_jianying_window(self, *, prefer: Literal["edit", "home", "any"] = "any"):
+        """在桌面顶层查找剪映窗口；prefer=edit 时优先 MainWindow，避免误绑仍存活的 HomePage。"""
+        desktop = uia.GetRootControl()
+        home = None
+        edit = None
+        for win in desktop.GetChildren():
+            try:
+                if (win.Name or "") != "剪映专业版":
+                    continue
+                cls = (win.ClassName or "").lower()
+            except Exception:
+                continue
+            if "mainwindow" in cls:
+                edit = win
+            elif "homepage" in cls:
+                home = win
+        if prefer == "edit" and edit is not None:
+            return edit, "edit"
+        if prefer == "home" and home is not None:
+            return home, "home"
+        if edit is not None:
+            return edit, "edit"
+        if home is not None:
+            return home, "home"
+        return None, None
+
+    def _wait_edit_window(self, timeout: float = 90.0) -> bool:
+        """等待并绑定编辑主窗 MainWindow。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.dismiss_blocking_dialogs(rounds=1)
+            win, status = self._find_jianying_window(prefer="edit")
+            if win is not None and status == "edit" and win.Exists(0):
+                self.app = win
+                self.app_status = "edit"
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _find_titlebar_export_btn(self):
+        """在当前编辑窗查找标题栏导出按钮（兼容深度/文案差异）。"""
+        if self.app is None:
+            return None
+        # 1) 官方自动化描述
+        for depth in (2, 3, 4, 5, 8):
+            try:
+                btn = self.app.TextControl(
+                    searchDepth=depth,
+                    Compare=ControlFinder.desc_matcher("MainWindowTitleBarExportBtn"),
+                )
+                if btn.Exists(0):
+                    return btn
+            except Exception:
+                pass
+        # 2) 可见文案「导出」
+        try:
+            btn = self.app.TextControl(searchDepth=8, Name="导出")
+            if btn.Exists(0):
+                return btn
+        except Exception:
+            pass
+        try:
+            btn = self.app.ButtonControl(searchDepth=8, Name="导出")
+            if btn.Exists(0):
+                return btn
+        except Exception:
+            pass
+        return None
+
+    def _wait_titlebar_export_btn(self, timeout: float = 90.0):
+        """长草稿加载后导出按钮会出现较晚，轮询等待。"""
+        deadline = time.time() + timeout
+        last_log = 0.0
+        while time.time() < deadline:
+            self.dismiss_blocking_dialogs(rounds=1)
+            win, status = self._find_jianying_window(prefer="edit")
+            if win is not None and status == "edit" and win.Exists(0):
+                self.app = win
+                self.app_status = "edit"
+                btn = self._find_titlebar_export_btn()
+                if btn is not None:
+                    return btn
+            now = time.time()
+            if now - last_log >= 8.0:
+                print(f"[导出] 仍在等待编辑页导出按钮… remaining={deadline - now:.0f}s")
+                last_log = now
+            time.sleep(0.25)
+        return None
+
     def get_window(self, *, activate: bool = True) -> None:
         """寻找剪映窗口；activate=True 时置顶（等待阶段应传 False，避免拖慢）。"""
-        if hasattr(self, "app") and self.app.Exists(0):
+        if hasattr(self, "app") and self.app is not None:
             try:
-                self.app.SetTopmost(False)
+                if self.app.Exists(0):
+                    self.app.SetTopmost(False)
             except Exception:
                 pass
 
-        self.app = uia.WindowControl(searchDepth=1, Compare=self.__jianying_window_cmp)
-        if not self.app.Exists(0):
-            raise AutomationError("剪映窗口未找到")
+        # 已在导出流程中优先编辑窗；目录页操作优先首页
+        prefer: Literal["edit", "home", "any"] = "any"
+        if getattr(self, "app_status", None) == "edit":
+            prefer = "edit"
+        elif getattr(self, "app_status", None) == "home":
+            prefer = "home"
+
+        win, status = self._find_jianying_window(prefer=prefer)
+        if win is None:
+            # 回退：原 Compare 查找
+            self.app = uia.WindowControl(searchDepth=1, Compare=self.__jianying_window_cmp)
+            if not self.app.Exists(0):
+                raise AutomationError("剪映窗口未找到")
+        else:
+            self.app = win
+            self.app_status = status or "home"
 
         # 寻找可能存在的导出窗口
-        export_window = self.app.WindowControl(searchDepth=1, Name="导出")
-        if export_window.Exists(0):
-            self.app = export_window
-            self.app_status = "pre_export"
+        try:
+            export_window = self.app.WindowControl(searchDepth=1, Name="导出")
+            if export_window.Exists(0):
+                self.app = export_window
+                self.app_status = "pre_export"
+        except Exception:
+            pass
 
         if activate:
-            self.app.SetActive()
-            self.app.SetTopmost()
+            try:
+                self.app.SetActive()
+                self.app.SetTopmost()
+            except Exception:
+                pass
 
     def __jianying_window_cmp(self, control: uia.WindowControl, depth: int) -> bool:
         if control.Name != "剪映专业版":
             return False
-        if "HomePage".lower() in control.ClassName.lower():
-            self.app_status = "home"
-            return True
         if "MainWindow".lower() in control.ClassName.lower():
             self.app_status = "edit"
+            return True
+        if "HomePage".lower() in control.ClassName.lower():
+            self.app_status = "home"
             return True
         return False
