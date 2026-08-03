@@ -60,7 +60,7 @@ class JianyingController:
     """剪映窗口"""
     app_status: Literal["home", "edit", "pre_export"]
 
-    # 仅匹配明确的干扰弹窗标题（禁止对剪映主窗做深度 SubName 扫描，否则会卡死）
+    # 仅匹配明确的干扰弹窗标题/文案（禁止对剪映主窗做深度 SubName 扫描，否则会卡死）
     _BLOCKING_POPUP_KEYWORDS = (
         "未检测到音频",
         "未检测到",
@@ -68,6 +68,12 @@ class JianyingController:
         "没有监测的音频",
         "监测的音频",
         "未发现音频",
+        # 删除任务草稿或草稿目录异常后，启动时常弹；点确认即可，一般不影响本次导出
+        "草稿丢失",
+        "草稿已丢失",
+        "部分草稿",
+        "无法找到草稿",
+        "找不到草稿",
     )
     _DISMISS_BUTTON_NAMES = (
         "确定",
@@ -86,7 +92,10 @@ class JianyingController:
         self.dismiss_blocking_dialogs()
 
     def dismiss_blocking_dialogs(self, rounds: int = 1) -> int:
-        """轻量关闭桌面顶层「音频设备」类弹窗（仅看窗口标题，不做 Exists 超时等待）。"""
+        """轻量关闭干扰弹窗（音频设备 / 草稿丢失等）。
+
+        优先按桌面顶层窗口标题匹配；若标题仅为「提示」等，再在剪映主窗下浅搜文案后点确认。
+        """
         closed = 0
         for _ in range(max(1, rounds)):
             hit = False
@@ -106,9 +115,61 @@ class JianyingController:
                         time.sleep(0.15)
             except Exception:
                 pass
+            # 主窗内嵌弹窗：标题常为「提示」，正文才含「草稿丢失」
+            try:
+                app = getattr(self, "app", None)
+                if app is not None and app.Exists(0):
+                    if self._dismiss_by_message_under(app):
+                        closed += 1
+                        hit = True
+                        time.sleep(0.15)
+            except Exception:
+                pass
             if not hit:
                 break
         return closed
+
+    def _dismiss_by_message_under(self, root) -> bool:
+        """在根节点下浅搜含关键词的文案，再点同级/父级确认按钮。"""
+        if root is None:
+            return False
+        try:
+            children = list(root.GetChildren())
+        except Exception:
+            return False
+        for child in children:
+            try:
+                name = child.Name or ""
+            except Exception:
+                continue
+            if name and any(k in name for k in self._BLOCKING_POPUP_KEYWORDS):
+                # 文案控件本身或父级对话框上点确认
+                if self._click_dismiss_button_under(child):
+                    print(f"已关闭剪映提示弹窗(文案): {name[:40]}")
+                    return True
+                parent = None
+                try:
+                    parent = child.GetParentControl()
+                except Exception:
+                    parent = None
+                if parent is not None and self._click_dismiss_button_under(parent):
+                    print(f"已关闭剪映提示弹窗(父级): {name[:40]}")
+                    return True
+            # 再下一层（常见：Window/Group -> Text）
+            try:
+                for grand in child.GetChildren():
+                    try:
+                        gname = grand.Name or ""
+                    except Exception:
+                        continue
+                    if not gname or not any(k in gname for k in self._BLOCKING_POPUP_KEYWORDS):
+                        continue
+                    if self._click_dismiss_button_under(child) or self._click_dismiss_button_under(grand):
+                        print(f"已关闭剪映提示弹窗(嵌套): {gname[:40]}")
+                        return True
+            except Exception:
+                continue
+        return False
 
     def _click_dismiss_button_under(self, root) -> bool:
         """仅在已锁定的弹窗根节点下浅搜确认按钮（Exists(0) 避免数秒空等）。"""
