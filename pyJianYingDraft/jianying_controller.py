@@ -459,10 +459,29 @@ class JianyingController:
         # 尽量设为指定分辨率/帧率（短超时；失败仅警告，不阻断导出）
         self._try_set_export_resolution_framerate(resolution, framerate)
 
-        # 立刻点导出确认
+        # 立刻点导出确认（勿再 SetActive 主窗，否则会关掉「导出」对话框）
         print("[导出] 点击导出确认按钮…")
-        self.get_window()
-        export_btn = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True))
+        try:
+            self.get_window(activate=False)
+        except Exception:
+            pass
+        # 优先在「导出」子窗上找确认按钮
+        export_root = self.app
+        try:
+            dlg = self.app.WindowControl(searchDepth=1, Name="导出")
+            if dlg.Exists(0):
+                export_root = dlg
+                self.app = dlg
+                self.app_status = "pre_export"
+        except Exception:
+            pass
+        export_btn = export_root.TextControl(
+            searchDepth=2, Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True)
+        )
+        if not export_btn.Exists(0):
+            export_btn = self.app.TextControl(
+                searchDepth=2, Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True)
+            )
         if not export_btn.Exists(0):
             raise AutomationError("未在导出窗口中找到导出按钮")
         export_btn.Click(simulateMove=False)
