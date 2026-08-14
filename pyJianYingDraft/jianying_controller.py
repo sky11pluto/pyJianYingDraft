@@ -375,6 +375,174 @@ class JianyingController:
                 "请确认剪映默认导出目录与 output_path 一致"
             )
 
+    def _export_window_roots(self) -> List:
+        """当前「导出」窗口（完成页标题仍是「导出」）。"""
+        roots = []
+        app = getattr(self, "app", None)
+        if app is not None:
+            try:
+                if (app.Name or "") == "导出" and app.Exists(0):
+                    roots.append(app)
+            except Exception:
+                pass
+            try:
+                dlg = app.WindowControl(searchDepth=1, Name="导出")
+                if dlg.Exists(0):
+                    roots.append(dlg)
+            except Exception:
+                pass
+        try:
+            desktop = uia.GetRootControl()
+            for win in desktop.GetChildren():
+                try:
+                    if (win.Name or "") == "导出" and win.Exists(0):
+                        roots.append(win)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return roots
+
+    def _cheap_named_control(self, root, name: str, depths=(2, 3, 4)):
+        """按 Name 浅搜，Exists(0) 避免空等。"""
+        if root is None or not name:
+            return None
+        for depth in depths:
+            for factory_name in ("ButtonControl", "TextControl", "HyperlinkControl"):
+                factory = getattr(root, factory_name, None)
+                if factory is None:
+                    continue
+                try:
+                    ctrl = factory(Name=name, searchDepth=depth)
+                    if ctrl.Exists(0):
+                        return ctrl
+                except Exception:
+                    continue
+        return None
+
+    def _latest_export_mp4(
+        self,
+        output_path: Optional[str],
+        draft_name: str,
+        since_ts: float,
+    ) -> Optional[str]:
+        """查找本次导出产生的 mp4。"""
+        dirs = []
+        if output_path:
+            dirs.append(os.path.dirname(os.path.abspath(output_path)))
+        seen = set()
+        found = []
+        for d in dirs:
+            if not d or d in seen or not os.path.isdir(d):
+                continue
+            seen.add(d)
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for name in names:
+                if not name.lower().endswith(".mp4"):
+                    continue
+                full = os.path.join(d, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                if st.st_mtime < since_ts - 8 or st.st_size < 1024:
+                    continue
+                found.append(full)
+        if not found:
+            return None
+        preferred = [p for p in found if draft_name and draft_name in os.path.basename(p)]
+        return max(preferred or found, key=os.path.getmtime)
+
+    def _click_export_close_by_position(self, root) -> bool:
+        """5.9 完成页右下角「关闭」（发布在其左侧）。"""
+        try:
+            rect = root.BoundingRectangle
+            w = int(rect.right - rect.left)
+            h = int(rect.bottom - rect.top)
+            if w < 200 or h < 200:
+                return False
+            x = int(rect.right - min(64, max(40, w * 0.08)))
+            y = int(rect.bottom - min(36, max(24, h * 0.06)))
+            uia.Click(x, y, waitTime=0.05)
+            return True
+        except Exception:
+            return False
+
+    def _control_has_text(self, root, needle: str, max_depth: int = 6) -> bool:
+        """浅搜可见文案，避免全树扫描卡死。"""
+        if root is None or not needle:
+            return False
+        target = needle.lower()
+
+        def _walk(node, depth: int) -> bool:
+            if depth > max_depth:
+                return False
+            try:
+                name = (node.Name or "").lower()
+            except Exception:
+                name = ""
+            if needle.lower() in name or target in name:
+                return True
+            try:
+                children = list(node.GetChildren())
+            except Exception:
+                return False
+            for child in children:
+                if _walk(child, depth + 1):
+                    return True
+            return False
+
+        try:
+            return _walk(root, 0)
+        except Exception:
+            return False
+
+    def _is_export_success_page(self, root) -> bool:
+        """剪映 5.9 导出完成后的发布引导页。"""
+        markers = ("打开文件夹", "分享链接", "发布视频", "让更多人看到你的作品")
+        if any(self._control_has_text(root, m, max_depth=5) for m in markers):
+            return True
+        # 完成页同时有「发布」和「关闭」；进度页一般没有这对按钮
+        return self._control_has_text(root, "关闭", max_depth=5) and self._control_has_text(
+            root, "发布", max_depth=5
+        )
+
+    def _click_named_close(self, root) -> bool:
+        """只点文案为「关闭」的按钮，绝不点「发布」。"""
+        btn = self._cheap_named_control(root, "关闭")
+        if btn is None:
+            return False
+        try:
+            btn.Click(simulateMove=False)
+            return True
+        except Exception:
+            try:
+                parent = btn.GetParentControl()
+                if parent is not None:
+                    parent.Click(simulateMove=False)
+                    return True
+            except Exception:
+                return False
+        return False
+
+    def _click_export_succeed_close(self) -> bool:
+        """导出完成页点「关闭」。禁止深搜 AutomationId，避免卡死 UIA。"""
+        roots = self._export_window_roots()
+        if not roots:
+            return False
+        for root in roots:
+            opened = self._cheap_named_control(root, "打开文件夹")
+            share = self._cheap_named_control(root, "分享链接")
+            publish = self._cheap_named_control(root, "发布")
+            if opened is None and share is None and publish is None:
+                continue
+            if self._click_named_close(root):
+                return True
+        return False
+
     def export_draft(self, draft_name: str, output_path: Optional[str] = None, *,
                      resolution: Optional[ExportResolution] = None,
                      framerate: Optional[ExportFramerate] = None,
@@ -488,35 +656,64 @@ class JianyingController:
         print("[导出] 已开始导出，等待完成…")
         time.sleep(1.2)
 
-        # 等待导出完成
+        # 先等文件落盘（长成片编码常超过 20 分钟）；完成页出现后再点关闭，进度中勿点以免取消
         st = time.time()
-        last_dismiss = 0.0
+        last_ui = 0.0
+        last_size = -1
+        stable_since = None
+        last_progress_log = 0.0
         while True:
             now = time.time()
-            if now - last_dismiss >= 8.0:
-                self.dismiss_blocking_dialogs(rounds=1)
-                last_dismiss = now
-            self.get_window(activate=False)
-            if self.app_status != "pre_export":
-                if output_path and os.path.isfile(output_path) and os.path.getsize(output_path) > 1024:
+            latest = self._latest_export_mp4(output_path, draft_name, export_since)
+            size = 0
+            if latest:
+                try:
+                    size = os.path.getsize(latest)
+                except OSError:
+                    size = 0
+            growing = bool(latest) and size > last_size > 0
+            if latest and size == last_size and size > 1024 * 1024:
+                if stable_since is None:
+                    stable_since = now
+            else:
+                stable_since = None
+            if size > 0:
+                last_size = size
+
+            file_stable = bool(latest) and stable_since is not None and (now - stable_since) >= 4.0
+            if now - last_progress_log >= 30.0:
+                elapsed = int(now - st)
+                if latest:
+                    print(f"[导出] 已等待 {elapsed}s，成片 {os.path.basename(latest)} {size / 1024 / 1024:.1f}MB")
+                else:
+                    print(f"[导出] 已等待 {elapsed}s，尚未出现 mp4")
+                last_progress_log = now
+
+            if file_stable:
+                if self._click_export_succeed_close():
+                    print("[导出] 已点击导出完成页「关闭」")
                     break
-                time.sleep(0.8)
-                if time.time() - st > timeout:
-                    raise AutomationError("导出超时, 时限为%d秒" % timeout)
-                continue
-
-            succeed_close_btn = self.app.TextControl(
-                searchDepth=2,
-                Compare=ControlFinder.desc_matcher("ExportSucceedCloseBtn"),
-            )
-            if succeed_close_btn.Exists(0):
-                succeed_close_btn.Click(simulateMove=False)
+                for root in self._export_window_roots():
+                    if self._click_export_close_by_position(root):
+                        print("[导出] 已按位置点击完成页「关闭」")
+                        break
+                print("[导出] 成片已就绪，继续收片")
                 break
+            if now - last_ui >= 5.0:
+                last_ui = now
+                # 仅完成页（有打开文件夹/发布）才点关闭，编码中不点以免取消
+                if self._click_export_succeed_close():
+                    print("[导出] 已点击导出完成页「关闭」")
+                    break
 
-            if time.time() - st > timeout:
+            # 仍在编码：超时后再宽限 3 分钟
+            limit = timeout
+            if growing or (latest and not file_stable):
+                limit = max(timeout, now - st + 180)
+            if now - st > limit:
                 raise AutomationError("导出超时, 时限为%d秒" % timeout)
 
-            time.sleep(0.8)
+            time.sleep(2.0)
         time.sleep(0.5)
 
         # 回到目录页
