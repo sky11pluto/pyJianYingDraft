@@ -68,10 +68,16 @@ class JianyingController:
         "没有监测的音频",
         "监测的音频",
         "未发现音频",
-        # 删除任务草稿或草稿目录异常后，启动时常弹；点确认即可，一般不影响本次导出
+    )
+    # 「草稿列表异常」必须点「取消」（点确认会进恢复引导，挡住目录/编辑）
+    _DRAFT_LIST_EXCEPTION_KEYWORDS = (
+        "草稿列表异常",
+        "检测到部分草稿丢失",
+        "部分草稿丢失",
+        "如何恢复草稿",
+        "恢复草稿",
         "草稿丢失",
         "草稿已丢失",
-        "部分草稿",
         "无法找到草稿",
         "找不到草稿",
     )
@@ -85,37 +91,111 @@ class JianyingController:
         "Ok",
         "ok",
     )
+    _DRAFT_LIST_CANCEL_BUTTON_NAMES = (
+        "取消",
+        "关闭",
+        "否",
+    )
 
     def __init__(self):
         """初始化剪映控制器, 此时剪映应该处于目录页"""
         self.get_window()
         self.dismiss_blocking_dialogs()
 
-    def dismiss_blocking_dialogs(self, rounds: int = 1) -> int:
-        """轻量关闭干扰弹窗（音频设备 / 草稿丢失等）。
+    @staticmethod
+    def _is_likely_jianying_top(name: str, cls: str) -> bool:
+        n = name or ""
+        c = (cls or "").lower()
+        if any(
+            x in c
+            for x in ("chrome", "electron", "markdown", "cursor", "monaco", "msedge", "explorer")
+        ):
+            return False
+        if n == "剪映专业版" or n.startswith("剪映专业版"):
+            return True
+        if "剪映" in n:
+            return True
+        # 剪映特有类名；勿把任意 Qt MainWindow 当成剪映
+        if "homepage" in c or "lvinfodialog" in c:
+            return True
+        if "mainwindow" in c and ("jianying" in c or "lv" in c):
+            return True
+        return False
 
-        优先按桌面顶层窗口标题匹配；若标题仅为「提示」等，再在剪映主窗下浅搜文案后点确认。
+    @classmethod
+    def _is_draft_list_exception(cls, text: str) -> bool:
+        blob = text or ""
+        if "草稿列表异常" in blob:
+            return True
+        if "检测到部分草稿丢失" in blob:
+            return True
+        if "部分草稿" in blob and "恢复" in blob:
+            return True
+        if "草稿丢失" in blob or "草稿已丢失" in blob:
+            return True
+        # 不再把笼统 LVInfoDialog/JianyingPro 当异常文案（需配合尺寸+命名按钮）
+        return any(k in blob for k in ("无法找到草稿", "找不到草稿"))
+
+    @staticmethod
+    def _dialog_rect_ok(control) -> bool:
+        try:
+            rect = control.BoundingRectangle
+            w = int(rect.right) - int(rect.left)
+            h = int(rect.bottom) - int(rect.top)
+            cx = (int(rect.left) + int(rect.right)) // 2
+            cy = (int(rect.top) + int(rect.bottom)) // 2
+        except Exception:
+            return False
+        if cx < 0 or cy < 0:
+            return False
+        return 280 <= w <= 420 and 130 <= h <= 280
+
+
+    def dismiss_blocking_dialogs(self, rounds: int = 1) -> int:
+        """轻量关闭干扰弹窗（音频设备 / 草稿列表异常等）。
+
+        「草稿列表异常」只点「取消」；其它提示点「确定/确认」。
         """
         closed = 0
         for _ in range(max(1, rounds)):
             hit = False
+            # 优先：草稿列表异常 → 取消
+            try:
+                if self._dismiss_draft_list_exception():
+                    closed += 1
+                    hit = True
+                    time.sleep(0.2)
+            except Exception:
+                pass
             try:
                 desktop = uia.GetRootControl()
                 for win in desktop.GetChildren():
                     try:
                         name = (win.Name or "")
+                        cls = (win.ClassName or "")
                     except Exception:
                         continue
-                    if not name or not any(k in name for k in self._BLOCKING_POPUP_KEYWORDS):
+                    if not name:
                         continue
-                    if self._click_dismiss_button_under(win):
+                    if not self._is_likely_jianying_top(name, cls):
+                        continue
+                    if self._is_draft_list_exception(name):
+                        if self._click_named_buttons_under(win, self._DRAFT_LIST_CANCEL_BUTTON_NAMES):
+                            closed += 1
+                            hit = True
+                            print(f"已关闭剪映「草稿列表异常」（取消）: {name}")
+                            time.sleep(0.15)
+                        continue
+                    if not any(k in name for k in self._BLOCKING_POPUP_KEYWORDS):
+                        continue
+                    if self._click_named_buttons_under(win, self._DISMISS_BUTTON_NAMES):
                         closed += 1
                         hit = True
                         print(f"已关闭剪映提示弹窗: {name}")
                         time.sleep(0.15)
             except Exception:
                 pass
-            # 主窗内嵌弹窗：标题常为「提示」，正文才含「草稿丢失」
+            # 主窗内嵌弹窗
             try:
                 app = getattr(self, "app", None)
                 if app is not None and app.Exists(0):
@@ -129,10 +209,133 @@ class JianyingController:
                 break
         return closed
 
-    def _dismiss_by_message_under(self, root) -> bool:
-        """在根节点下浅搜含关键词的文案，再点同级/父级确认按钮。"""
+    def _dismiss_draft_list_exception(self) -> bool:
+        """专门关掉「草稿列表异常」：只点取消。
+
+        实测 UIA：HomePage 下子控件 Name=JianyingPro、ClassName 含 LVInfoDialog，约 353x143。
+        """
+        try:
+            desktop = uia.GetRootControl()
+            for win in desktop.GetChildren() or []:
+                try:
+                    name = win.Name or ""
+                    cls = win.ClassName or ""
+                except Exception:
+                    name, cls = "", ""
+                if not self._is_likely_jianying_top(name, cls):
+                    continue
+                extra = ""
+                try:
+                    kids = list(win.GetChildren() or [])[:40]
+                    extra = " ".join((c.Name or "") for c in kids if getattr(c, "Name", None))
+                    # 直接找 LVInfoDialog / JianyingPro 子控件
+                    for c in kids:
+                        try:
+                            cn = c.Name or ""
+                            cc = c.ClassName or ""
+                        except Exception:
+                            continue
+                        if "LVInfoDialog" in cc or (
+                            cn == "JianyingPro" and "LVInfo" in cc
+                        ):
+                            if not self._dialog_rect_ok(c):
+                                continue
+                            if self._click_named_buttons_under(
+                                c, self._DRAFT_LIST_CANCEL_BUTTON_NAMES
+                            ):
+                                print(
+                                    f"已关闭剪映「草稿列表异常」（LVInfoDialog）: {cn}/{cc[:40]}"
+                                )
+                                return True
+                            # 无命名按钮则跳过，禁止坐标盲点
+                            continue
+                except Exception:
+                    extra = ""
+                if not self._is_draft_list_exception(f"{name} {cls} {extra}"):
+                    continue
+                if not self._dialog_rect_ok(win) and "LVInfo" not in (cls or ""):
+                    # 顶层剪映主窗本身很大，只认子树已在上面处理；此处勿对主窗乱点
+                    continue
+                if self._click_named_buttons_under(win, self._DRAFT_LIST_CANCEL_BUTTON_NAMES):
+                    print(f"已关闭剪映「草稿列表异常」（取消）: {(name or extra)[:40]}")
+                    return True
+                if self._click_dialog_cancel_by_rect(win):
+                    print("已关闭剪映「草稿列表异常」（坐标点取消）")
+                    return True
+        except Exception:
+            pass
+        try:
+            app = getattr(self, "app", None)
+            if app is not None and app.Exists(0):
+                if self._dismiss_draft_list_under(app):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _dismiss_draft_list_under(self, root) -> bool:
         if root is None:
             return False
+        try:
+            children = list(root.GetChildren() or [])
+        except Exception:
+            return False
+        for child in children:
+            try:
+                name = child.Name or ""
+            except Exception:
+                name = ""
+            extra = ""
+            try:
+                extra = " ".join(
+                    (g.Name or "") for g in (child.GetChildren() or [])[:24]
+                    if getattr(g, "Name", None)
+                )
+            except Exception:
+                extra = ""
+            blob = f"{name} {extra}"
+            if not self._is_draft_list_exception(blob):
+                # 再下一层
+                try:
+                    for grand in child.GetChildren() or []:
+                        try:
+                            gname = grand.Name or ""
+                        except Exception:
+                            continue
+                        if self._is_draft_list_exception(gname):
+                            if self._click_named_buttons_under(
+                                child, self._DRAFT_LIST_CANCEL_BUTTON_NAMES
+                            ) or self._click_named_buttons_under(
+                                grand, self._DRAFT_LIST_CANCEL_BUTTON_NAMES
+                            ):
+                                print(f"已关闭剪映「草稿列表异常」（嵌套取消）: {gname[:40]}")
+                                return True
+                except Exception:
+                    pass
+                continue
+            if self._click_named_buttons_under(child, self._DRAFT_LIST_CANCEL_BUTTON_NAMES):
+                print(f"已关闭剪映「草稿列表异常」（取消）: {(name or extra)[:40]}")
+                return True
+            if self._click_dialog_cancel_by_rect(child):
+                print("已关闭剪映「草稿列表异常」（坐标点取消）")
+                return True
+        return False
+
+    def _click_dialog_cancel_by_rect(self, root) -> bool:
+        """【已禁用】禁止用屏幕坐标盲点「取消」。
+
+        历史事故：SetCursorPos 在焦点失败时会点到浏览器关闭钮、开始菜单/设置。
+        请只用命名按钮 UIA Click。
+        """
+        return False
+
+    def _dismiss_by_message_under(self, root) -> bool:
+        """在根节点下浅搜含关键词的文案，再点对应按钮。"""
+        if root is None:
+            return False
+        # 草稿列表异常优先
+        if self._dismiss_draft_list_under(root):
+            return True
         try:
             children = list(root.GetChildren())
         except Exception:
@@ -143,8 +346,7 @@ class JianyingController:
             except Exception:
                 continue
             if name and any(k in name for k in self._BLOCKING_POPUP_KEYWORDS):
-                # 文案控件本身或父级对话框上点确认
-                if self._click_dismiss_button_under(child):
+                if self._click_named_buttons_under(child, self._DISMISS_BUTTON_NAMES):
                     print(f"已关闭剪映提示弹窗(文案): {name[:40]}")
                     return True
                 parent = None
@@ -152,10 +354,11 @@ class JianyingController:
                     parent = child.GetParentControl()
                 except Exception:
                     parent = None
-                if parent is not None and self._click_dismiss_button_under(parent):
+                if parent is not None and self._click_named_buttons_under(
+                    parent, self._DISMISS_BUTTON_NAMES
+                ):
                     print(f"已关闭剪映提示弹窗(父级): {name[:40]}")
                     return True
-            # 再下一层（常见：Window/Group -> Text）
             try:
                 for grand in child.GetChildren():
                     try:
@@ -164,27 +367,31 @@ class JianyingController:
                         continue
                     if not gname or not any(k in gname for k in self._BLOCKING_POPUP_KEYWORDS):
                         continue
-                    if self._click_dismiss_button_under(child) or self._click_dismiss_button_under(grand):
+                    if self._click_named_buttons_under(
+                        child, self._DISMISS_BUTTON_NAMES
+                    ) or self._click_named_buttons_under(
+                        grand, self._DISMISS_BUTTON_NAMES
+                    ):
                         print(f"已关闭剪映提示弹窗(嵌套): {gname[:40]}")
                         return True
             except Exception:
                 continue
         return False
 
-    def _click_dismiss_button_under(self, root) -> bool:
-        """仅在已锁定的弹窗根节点下浅搜确认按钮（Exists(0) 避免数秒空等）。"""
+    def _click_named_buttons_under(self, root, names) -> bool:
+        """仅在已锁定的弹窗根节点下浅搜指定按钮（Exists(0) 避免数秒空等）。"""
         if root is None:
             return False
-        for btn_name in self._DISMISS_BUTTON_NAMES:
+        for btn_name in names:
             try:
-                btn = root.ButtonControl(Name=btn_name, searchDepth=3)
+                btn = root.ButtonControl(Name=btn_name, searchDepth=4)
                 if btn.Exists(0):
                     btn.Click(simulateMove=False)
                     return True
             except Exception:
                 pass
             try:
-                txt = root.TextControl(Name=btn_name, searchDepth=3)
+                txt = root.TextControl(Name=btn_name, searchDepth=4)
                 if txt.Exists(0):
                     try:
                         txt.Click(simulateMove=False)
@@ -198,6 +405,9 @@ class JianyingController:
                 pass
         return False
 
+    def _click_dismiss_button_under(self, root) -> bool:
+        """兼容旧调用：默认点确定/确认类按钮。"""
+        return self._click_named_buttons_under(root, self._DISMISS_BUTTON_NAMES)
     def _wait_control(self, factory, timeout: float = 15.0, interval: float = 0.25):
         """轮询等待控件出现，返回控件或 None。"""
         deadline = time.time() + timeout
@@ -457,19 +667,8 @@ class JianyingController:
         return max(preferred or found, key=os.path.getmtime)
 
     def _click_export_close_by_position(self, root) -> bool:
-        """5.9 完成页右下角「关闭」（发布在其左侧）。"""
-        try:
-            rect = root.BoundingRectangle
-            w = int(rect.right - rect.left)
-            h = int(rect.bottom - rect.top)
-            if w < 200 or h < 200:
-                return False
-            x = int(rect.right - min(64, max(40, w * 0.08)))
-            y = int(rect.bottom - min(36, max(24, h * 0.06)))
-            uia.Click(x, y, waitTime=0.05)
-            return True
-        except Exception:
-            return False
+        """【已禁用】完成页坐标点「关闭」同样会误点其它程序，改由命名按钮路径处理。"""
+        return False
 
     def _control_has_text(self, root, needle: str, max_depth: int = 6) -> bool:
         """浅搜可见文案，避免全树扫描卡死。"""
@@ -537,11 +736,77 @@ class JianyingController:
             opened = self._cheap_named_control(root, "打开文件夹")
             share = self._cheap_named_control(root, "分享链接")
             publish = self._cheap_named_control(root, "发布")
-            if opened is None and share is None and publish is None:
+            # 完成页常见：打开文件夹 / 发布；部分版本只有「关闭」
+            looks_done = (
+                opened is not None
+                or share is not None
+                or publish is not None
+                or self._is_export_success_page(root)
+                or self._cheap_named_control(root, "关闭") is not None
+            )
+            if not looks_done:
                 continue
             if self._click_named_close(root):
                 return True
+            # 文案可能是「完成」而非「关闭」
+            for label in ("完成", "关闭"):
+                btn = self._cheap_named_control(root, label)
+                if btn is None:
+                    continue
+                try:
+                    btn.Click(simulateMove=False)
+                    return True
+                except Exception:
+                    try:
+                        parent = btn.GetParentControl()
+                        if parent is not None:
+                            parent.Click(simulateMove=False)
+                            return True
+                    except Exception:
+                        continue
+            if self._click_export_close_by_position(root):
+                return True
         return False
+
+    def dismiss_export_success_ui(self, *, attempts: int = 10, interval: float = 1.0) -> bool:
+        """导出完成后强制关掉「导出」完成页，避免草稿仍被占用。"""
+        closed = False
+        for i in range(max(1, attempts)):
+            if self._click_export_succeed_close():
+                print(f"[导出] 已关闭导出完成页（第 {i + 1} 次尝试）")
+                closed = True
+                break
+            for root in self._export_window_roots():
+                if self._click_export_close_by_position(root):
+                    print(f"[导出] 已按位置关闭导出完成页（第 {i + 1} 次尝试）")
+                    closed = True
+                    break
+            if closed:
+                break
+            # Esc / Alt+F4 兜底（部分完成页 Esc 无效）
+            try:
+                uia.SendKeys("{Esc}")
+            except Exception:
+                pass
+            if i >= max(2, attempts // 2):
+                try:
+                    uia.SendKeys("%{F4}")
+                except Exception:
+                    pass
+            time.sleep(interval)
+        if not closed:
+            print("[导出] 警告：多次尝试仍未能关闭导出完成页")
+        # 尽量回到目录/主页，释放草稿锁
+        try:
+            self.get_window(activate=True)
+        except Exception:
+            pass
+        try:
+            self.switch_to_home()
+        except Exception:
+            pass
+        time.sleep(0.5)
+        return closed
 
     def export_draft(self, draft_name: str, output_path: Optional[str] = None, *,
                      resolution: Optional[ExportResolution] = None,
@@ -564,9 +829,11 @@ class JianyingController:
         """
         print(f"开始导出 {draft_name} 至 {output_path}")
         export_since = time.time()
-        self.dismiss_blocking_dialogs()
+        self.dismiss_blocking_dialogs(rounds=2)
         self.get_window()
         self.switch_to_home()
+        # 目录页扫草稿后可能再弹「草稿列表异常」，点草稿前必须关掉
+        self.dismiss_blocking_dialogs(rounds=2)
 
         # 点击对应草稿
         print(f"[导出] 查找草稿: {draft_name}")
@@ -575,14 +842,43 @@ class JianyingController:
             Compare=ControlFinder.desc_matcher(f"HomePageDraftTitle:{draft_name}", exact=True)
         )
         if not draft_name_text.Exists(0):
+            # 再关一次弹窗后重试找草稿（弹窗可能挡了列表刷新）
+            self.dismiss_blocking_dialogs(rounds=2)
+            time.sleep(0.5)
+            draft_name_text = self.app.TextControl(
+                searchDepth=2,
+                Compare=ControlFinder.desc_matcher(f"HomePageDraftTitle:{draft_name}", exact=True)
+            )
+        if not draft_name_text.Exists(0):
             raise exceptions.DraftNotFound(f"未找到名为{draft_name}的剪映草稿")
         draft_btn = draft_name_text.GetParentControl()
         assert draft_btn is not None
         draft_btn.Click(simulateMove=False)
         print("[导出] 已打开草稿，等待编辑器就绪…")
         # 长草稿加载慢：优先锁定 MainWindow（勿误用仍存活的 HomePage）
-        if not self._wait_edit_window(timeout=90.0):
-            raise AutomationError("打开草稿后未进入编辑窗口（MainWindow）")
+        if not self._wait_edit_window(timeout=120.0):
+            # 若仍被「草稿列表异常」挡住，关后再双击草稿重试
+            self.dismiss_blocking_dialogs(rounds=3)
+            time.sleep(0.6)
+            try:
+                # 二次查找：可能仍在目录页
+                self.switch_to_home()
+                self.dismiss_blocking_dialogs(rounds=2)
+                draft_name_text2 = self.app.TextControl(
+                    searchDepth=2,
+                    Compare=ControlFinder.desc_matcher(f"HomePageDraftTitle:{draft_name}", exact=True)
+                )
+                if draft_name_text2.Exists(0):
+                    btn2 = draft_name_text2.GetParentControl()
+                    if btn2 is not None:
+                        print("[导出] 未进编辑窗，二次双击草稿…")
+                        btn2.DoubleClick(simulateMove=False)
+            except Exception as exc:
+                print(f"[导出] 二次打开草稿失败: {exc}")
+            if not self._wait_edit_window(timeout=90.0):
+                self.dismiss_blocking_dialogs(rounds=2)
+                if not self._wait_edit_window(timeout=60.0):
+                    raise AutomationError("打开草稿后未进入编辑窗口（MainWindow）")
         self.app.SetActive()
         try:
             self.app.SetTopmost()
@@ -690,14 +986,31 @@ class JianyingController:
                 last_progress_log = now
 
             if file_stable:
-                if self._click_export_succeed_close():
-                    print("[导出] 已点击导出完成页「关闭」")
-                    break
-                for root in self._export_window_roots():
-                    if self._click_export_close_by_position(root):
-                        print("[导出] 已按位置点击完成页「关闭」")
+                # 成片已落盘：优先关掉完成页；关不掉也重试数次，避免草稿一直 .locked
+                closed = False
+                for attempt in range(8):
+                    if self._click_export_succeed_close():
+                        print(f"[导出] 已点击导出完成页「关闭」（attempt={attempt + 1}）")
+                        closed = True
                         break
-                print("[导出] 成片已就绪，继续收片")
+                    pos_ok = False
+                    for root in self._export_window_roots():
+                        if self._click_export_close_by_position(root):
+                            print(f"[导出] 已按位置点击完成页「关闭」（attempt={attempt + 1}）")
+                            pos_ok = True
+                            break
+                    if pos_ok:
+                        closed = True
+                        break
+                    try:
+                        uia.SendKeys("{Esc}")
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                if not closed:
+                    print("[导出] 成片已就绪但未能关闭完成页，继续收片（后续会再尝试关窗）")
+                else:
+                    print("[导出] 成片已就绪，继续收片")
                 break
             if now - last_ui >= 5.0:
                 last_ui = now
@@ -716,13 +1029,16 @@ class JianyingController:
             time.sleep(2.0)
         time.sleep(0.5)
 
-        # 回到目录页
-        self.get_window(activate=True)
+        # 回到目录页（再强制关一次完成页）
         try:
-            self.switch_to_home()
-        except AutomationError:
-            pass
-        time.sleep(0.5)
+            self.dismiss_export_success_ui(attempts=5, interval=0.8)
+        except Exception:
+            self.get_window(activate=True)
+            try:
+                self.switch_to_home()
+            except AutomationError:
+                pass
+            time.sleep(0.5)
 
         if output_path is not None:
             self._settle_exported_file(
@@ -775,14 +1091,19 @@ class JianyingController:
     def _wait_edit_window(self, timeout: float = 90.0) -> bool:
         """等待并绑定编辑主窗 MainWindow。"""
         deadline = time.time() + timeout
+        last_dismiss = 0.0
         while time.time() < deadline:
-            self.dismiss_blocking_dialogs(rounds=1)
+            now = time.time()
+            # 不要每 0.2s 扫一遍 UIA（comtypes DEBUG 会刷爆控制台）
+            if now - last_dismiss >= 2.0:
+                self.dismiss_blocking_dialogs(rounds=1)
+                last_dismiss = now
             win, status = self._find_jianying_window(prefer="edit")
             if win is not None and status == "edit" and win.Exists(0):
                 self.app = win
                 self.app_status = "edit"
                 return True
-            time.sleep(0.2)
+            time.sleep(0.35)
         return False
 
     def _find_titlebar_export_btn(self):
